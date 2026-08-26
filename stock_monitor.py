@@ -166,8 +166,8 @@ class TriggerEvaluator:
         self.volume_threshold = avg_volume * config.volume_multiplier
 
     def price_condition_met(self, current_price: float) -> bool:
-        band = self.config.target_price * (self.config.price_tolerance_pct / 100)
-        return abs(current_price - self.config.target_price) <= band
+        # Triggers if price is at or above the target resistance
+        return current_price >= self.config.target_price
 
     def volume_condition_met(self, current_volume: float) -> bool:
         return current_volume >= self.volume_threshold
