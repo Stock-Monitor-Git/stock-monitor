@@ -301,11 +301,13 @@ def parse_args() -> MonitorConfig:
                          help="Lookback window in days for average volume baseline (default 20)")
     parser.add_argument("--cooldown-minutes", type=int, default=30,
                          help="Minutes to wait before re-alerting (default 30)")
-    parser.add_argument("--state-file", type=str, default="alert_state.json",
-                         help="File used to persist the cooldown timer across runs (default alert_state.json)")
+    parser.add_argument("--state-file", type=str, default=None,
+                         help="File used to persist the cooldown timer across runs "
+                              "(default: alert_state_<TICKER>.json)")
     parser.add_argument("--once", action="store_true", help="Run a single check and exit, instead of looping")
 
     args = parser.parse_args()
+    state_file = args.state_file or f"alert_state_{args.ticker.upper()}.json"
     return MonitorConfig(
         ticker=args.ticker,
         target_price=args.target_price,
@@ -314,7 +316,7 @@ def parse_args() -> MonitorConfig:
         poll_interval_sec=args.poll_interval,
         avg_volume_lookback_days=args.avg_volume_days,
         cooldown_minutes=args.cooldown_minutes,
-        state_file=args.state_file,
+        state_file=state_file,
     ), args.once
 
 
