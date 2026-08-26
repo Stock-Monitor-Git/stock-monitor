@@ -39,9 +39,12 @@ jobs:
 
       - name: Save cooldown state
         run: |
-          git config user.name "stock-monitor-bot"
-          git config user.email "actions@github.com"
-          git add alert_state.json
-          git diff --staged --quiet || git commit -m "Update alert cooldown state [skip ci]"
-          git push
-
+          if [ -f alert_state.json ]; then
+            git config user.name "stock-monitor-bot"
+            git config user.email "actions@github.com"
+            git add alert_state.json
+            git diff --staged --quiet || git commit -m "Update alert cooldown state [skip ci]"
+            git push
+          else
+            echo "No alert_state.json yet (no alert has fired) — nothing to commit."
+          fi
