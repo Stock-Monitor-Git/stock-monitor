@@ -1,1 +1,47 @@
+name: Stock Monitor
+
+on:
+  schedule:
+    # Runs every 15 minutes. GitHub's free scheduler isn't second-precise —
+    # actual runs can lag a few minutes during busy periods.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated cooldown state file back
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stock check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python stock_monitor.py \
+            --ticker "${{ vars.STOCK_TICKER }}" \
+            --target-price "${{ vars.TARGET_PRICE }}" \
+            --volume-multiplier "${{ vars.VOLUME_MULTIPLIER || '2.0' }}" \
+            --once
+
+      - name: Save cooldown state
+        run: |
+          git config user.name "stock-monitor-bot"
+          git config user.email "actions@github.com"
+          git add alert_state.json
+          git diff --staged --quiet || git commit -m "Update alert cooldown state [skip ci]"
+          git push
 
