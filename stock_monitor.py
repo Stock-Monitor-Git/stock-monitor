@@ -288,10 +288,27 @@ class StockMonitor:
 # CLI
 # --------------------------------------------------------------------------
 
+def _load_target_price_from_config(ticker: str, config_file: str) -> Optional[float]:
+    """Looks up {ticker}.target_price in the JSON config. Returns None on any
+    missing file/key/null value so the caller can fall back to the CLI arg."""
+    if not os.path.exists(config_file):
+        return None
+    try:
+        with open(config_file, "r") as f:
+            data = json.load(f)
+        price = data.get(ticker.upper(), {}).get("target_price")
+        return float(price) if price is not None else None
+    except (json.JSONDecodeError, ValueError, OSError, AttributeError) as e:
+        log.warning(f"Could not read target price from {config_file}: {e}")
+        return None
+
+
 def parse_args() -> MonitorConfig:
     parser = argparse.ArgumentParser(description="Monitor a stock for a price + volume breakout alert.")
     parser.add_argument("--ticker", required=True, help="Stock ticker symbol, e.g. AAPL")
     parser.add_argument("--target-price", required=True, type=float, help="Target/resistance price")
+    parser.add_argument("--config-file", type=str, default="targets.json",
+                         help="JSON file mapping ticker -> target_price, takes priority over --target-price if set (default: targets.json)")
     parser.add_argument("--volume-multiplier", type=float, default=2.0,
                          help="Volume must be >= this multiple of the average daily volume (default 2.0)")
     parser.add_argument("--price-tolerance-pct", type=float, default=0.15,
@@ -308,9 +325,15 @@ def parse_args() -> MonitorConfig:
 
     args = parser.parse_args()
     state_file = args.state_file or f"alert_state_{args.ticker.upper()}.json"
+
+    # JSON config takes priority; --target-price is the fallback if it's null/missing/unreadable.
+    target_price = _load_target_price_from_config(args.ticker, args.config_file)
+    if target_price is None:
+        target_price = args.target_price
+
     return MonitorConfig(
         ticker=args.ticker,
-        target_price=args.target_price,
+        target_price=target_price,
         volume_multiplier=args.volume_multiplier,
         price_tolerance_pct=args.price_tolerance_pct,
         poll_interval_sec=args.poll_interval,
