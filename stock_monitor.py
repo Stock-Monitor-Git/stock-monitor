@@ -77,8 +77,21 @@ class MonitorSettings:
 
 
 def load_watchlist(args: argparse.Namespace) -> List[WatchItem]:
-    # 1. Single-stock override via CLI (useful for quick tests, or for callers
-    #    that already loop externally, e.g. a GitHub Actions matrix).
+    """Builds the effective watchlist by MERGING every source that's present —
+    not "first source wins" — so you and a collaborator can each maintain your
+    own file and both sets of tickers get watched. If the same ticker appears
+    in more than one source, the first one found (by the order below) wins for
+    that ticker, and a warning is logged so conflicts aren't silent.
+
+    Sources, all merged together:
+      1. --ticker / --target-price CLI flags (single stock — used alone, bypasses everything else)
+      2. the WATCHLIST environment variable (JSON string — this is what your
+         STOCKS GitHub Actions variable feeds in)
+      3. watchlist.json (a single shared file, if present)
+      4. every *.json file inside the watchlists/ folder (if present) — this is
+         the "everyone has their own file" option: e.g. watchlists/sagi.json,
+         watchlists/friend.json
+    """
     if args.ticker and args.target_price is not None:
         return [WatchItem(
             ticker=args.ticker.upper(),
@@ -86,24 +99,49 @@ def load_watchlist(args: argparse.Namespace) -> List[WatchItem]:
             volume_multiplier=args.volume_multiplier,
         )]
 
-    # 2. WATCHLIST environment variable (JSON string).
+    def parse_items(raw_items: list) -> List[WatchItem]:
+        return [WatchItem(i["ticker"].upper(), float(i["target_price"]),
+                           float(i.get("volume_multiplier", 2.0))) for i in raw_items]
+
+    sources: List[List[WatchItem]] = []
+
     raw = os.environ.get("WATCHLIST")
     if raw:
-        items = json.loads(raw)
-        return [WatchItem(i["ticker"].upper(), float(i["target_price"]),
-                           float(i.get("volume_multiplier", 2.0))) for i in items]
+        sources.append(parse_items(json.loads(raw)))
 
-    # 3. watchlist.json file.
     if os.path.exists(args.watchlist_file):
         with open(args.watchlist_file) as f:
-            items = json.load(f)
-        return [WatchItem(i["ticker"].upper(), float(i["target_price"]),
-                           float(i.get("volume_multiplier", 2.0))) for i in items]
+            sources.append(parse_items(json.load(f)))
 
-    raise ValueError(
-        "No watchlist found. Provide --ticker + --target-price, set the WATCHLIST "
-        f"env var, or create {args.watchlist_file}."
-    )
+    if os.path.isdir(args.watchlist_dir):
+        for fname in sorted(os.listdir(args.watchlist_dir)):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(args.watchlist_dir, fname)
+            try:
+                with open(path) as f:
+                    sources.append(parse_items(json.load(f)))
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                log.error(f"Could not parse watchlist file {path}: {e}")
+
+    if not sources:
+        raise ValueError(
+            "No watchlist found. Provide --ticker + --target-price, set the WATCHLIST "
+            f"env var, create {args.watchlist_file}, or add files to {args.watchlist_dir}/."
+        )
+
+    merged: dict[str, WatchItem] = {}
+    for source in sources:
+        for item in source:
+            if item.ticker in merged:
+                log.warning(
+                    f"Ticker {item.ticker} appears in more than one watchlist source — "
+                    f"keeping target_price={merged[item.ticker].target_price} "
+                    f"(ignoring duplicate target_price={item.target_price})."
+                )
+            else:
+                merged[item.ticker] = item
+    return list(merged.values())
 
 
 # ==========================================================================
@@ -455,7 +493,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--volume-multiplier", type=float, default=2.0,
                          help="Volume must be >= this multiple of average volume (default 2.0)")
     parser.add_argument("--watchlist-file", type=str, default="watchlist.json",
-                         help="Path to a JSON watchlist file (default watchlist.json)")
+                         help="Path to a single shared JSON watchlist file (default watchlist.json)")
+    parser.add_argument("--watchlist-dir", type=str, default="watchlists",
+                         help="Folder of per-person JSON watchlist files, merged together (default watchlists/)")
     parser.add_argument("--price-tolerance-pct", type=float, default=0.15,
                          help="Percent band around target price counted as 'touched' (default 0.15)")
     parser.add_argument("--poll-interval", type=int, default=120,
@@ -486,9 +526,10 @@ def main() -> None:
     monitor = WatchlistMonitor(settings, notifier)
 
     if args.once:
-        # In one-shot mode (e.g. cron/CI), skip the market-hours gate entirely —
-        # the scheduler is what decides when to run; we just check when asked.
-        monitor.check_all_once()
+        if settings.market_hours_only and not is_market_hours():
+            log.info("Outside US market hours (9:30-16:00 ET, Mon-Fri) — skipping this check.")
+        else:
+            monitor.check_all_once()
     else:
         try:
             monitor.run_loop()
