@@ -1,11 +1,18 @@
 """
 stock_monitor.py
 -----------------
-Monitors a stock for a price-near-resistance + high-volume breakout condition
-and sends an alert via Telegram and/or Discord.
+Monitors a watchlist of stock tickers for a "resistance breakout + high volume"
+condition and sends alerts to Discord (rich embed) and/or Telegram (and,
+optionally, WhatsApp via CallMeBot). Designed to run either as a single
+one-shot check (e.g. from a cron job / GitHub Actions) or as a continuous
+loop that respects US market hours.
 
-Run: python stock_monitor.py --ticker AAPL --target-price 230.00 --volume-multiplier 2.0
-See README section at the bottom of this file (or the chat message) for full setup.
+Quick start:
+    pip install -r requirements.txt
+    python stock_monitor.py --once            # one check of the whole watchlist
+    python stock_monitor.py                   # continuous loop (Ctrl+C to stop)
+
+See the bottom of this file / README for full setup instructions.
 """
 
 from __future__ import annotations
@@ -16,9 +23,10 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, time as dtime
+from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 import yfinance as yf
@@ -30,114 +38,84 @@ logging.basicConfig(
 )
 log = logging.getLogger("stock_monitor")
 
+EASTERN = ZoneInfo("America/New_York")
+MARKET_OPEN = dtime(9, 30)
+MARKET_CLOSE = dtime(16, 0)
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
+
+# ==========================================================================
+# 1. CONFIGURATION — defining what to watch
+# ==========================================================================
+# Each entry in the watchlist is one ticker + its own resistance target and
+# volume-spike multiplier. The watchlist can come from (in priority order):
+#   1. --ticker/--target-price/--volume-multiplier CLI flags (single stock)
+#   2. the WATCHLIST environment variable (a JSON string — handy for CI secrets/vars)
+#   3. a watchlist.json file next to this script
+#
+# Example watchlist.json:
+# [
+#   {"ticker": "AAPL", "target_price": 230.00, "volume_multiplier": 2.0},
+#   {"ticker": "TSLA", "target_price": 300.00, "volume_multiplier": 2.5}
+# ]
 
 @dataclass
-class MonitorConfig:
+class WatchItem:
     ticker: str
     target_price: float
-    volume_multiplier: float = 2.0          # trigger when volume > multiplier * avg volume
-    price_tolerance_pct: float = 0.15        # % band around target price counted as "touched"
-    poll_interval_sec: int = 60              # how often to poll
-    avg_volume_lookback_days: int = 20       # window for the "average volume" baseline
-    cooldown_minutes: int = 30               # don't re-alert for the same condition within this window
-    state_file: str = "alert_state.json"     # persists last-alert time across separate process runs (e.g. CI)
+    volume_multiplier: float = 2.0
 
 
-# --------------------------------------------------------------------------
-# Notifiers
-# --------------------------------------------------------------------------
-
-class Notifier:
-    def send(self, message: str) -> bool:
-        raise NotImplementedError
-
-
-class TelegramNotifier(Notifier):
-    def __init__(self, bot_token: str, chat_id: str):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-
-    def send(self, message: str) -> bool:
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        try:
-            resp = requests.post(
-                url,
-                data={"chat_id": self.chat_id, "text": message, "parse_mode": "Markdown"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return True
-        except requests.RequestException as e:
-            log.error(f"Telegram notification failed: {e}")
-            return False
+@dataclass
+class MonitorSettings:
+    """Settings shared across every ticker in the watchlist."""
+    watchlist: List[WatchItem]
+    price_tolerance_pct: float = 0.15       # % band around target price counted as "touched"
+    poll_interval_sec: int = 120            # how often to run a check cycle in loop mode
+    avg_volume_lookback_days: int = 20      # window for the "average volume" baseline
+    cooldown_minutes: int = 30              # don't re-alert the same ticker within this window
+    market_hours_only: bool = True          # skip checks outside US market hours (9:30-16:00 ET, Mon-Fri)
 
 
-class DiscordNotifier(Notifier):
-    def __init__(self, webhook_url: str):
-        self.webhook_url = webhook_url
+def load_watchlist(args: argparse.Namespace) -> List[WatchItem]:
+    # 1. Single-stock override via CLI (useful for quick tests, or for callers
+    #    that already loop externally, e.g. a GitHub Actions matrix).
+    if args.ticker and args.target_price is not None:
+        return [WatchItem(
+            ticker=args.ticker.upper(),
+            target_price=args.target_price,
+            volume_multiplier=args.volume_multiplier,
+        )]
 
-    def send(self, message: str) -> bool:
-        try:
-            resp = requests.post(self.webhook_url, json={"content": message}, timeout=10)
-            resp.raise_for_status()
-            return True
-        except requests.RequestException as e:
-            log.error(f"Discord notification failed: {e}")
-            return False
+    # 2. WATCHLIST environment variable (JSON string).
+    raw = os.environ.get("WATCHLIST")
+    if raw:
+        items = json.loads(raw)
+        return [WatchItem(i["ticker"].upper(), float(i["target_price"]),
+                           float(i.get("volume_multiplier", 2.0))) for i in items]
 
+    # 3. watchlist.json file.
+    if os.path.exists(args.watchlist_file):
+        with open(args.watchlist_file) as f:
+            items = json.load(f)
+        return [WatchItem(i["ticker"].upper(), float(i["target_price"]),
+                           float(i.get("volume_multiplier", 2.0))) for i in items]
 
-class MultiNotifier(Notifier):
-    """Fans a message out to every configured notifier."""
-
-    def __init__(self, notifiers: List[Notifier]):
-        self.notifiers = notifiers
-
-    def send(self, message: str) -> bool:
-        if not self.notifiers:
-            log.warning("No notifiers configured — alert would not be delivered anywhere.")
-            return False
-        results = [n.send(message) for n in self.notifiers]
-        return any(results)
-
-
-def build_notifier_from_env() -> MultiNotifier:
-    notifiers: List[Notifier] = []
-
-    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
-    if tg_token and tg_chat:
-        notifiers.append(TelegramNotifier(tg_token, tg_chat))
-        log.info("Telegram notifier enabled.")
-
-    discord_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if discord_url:
-        notifiers.append(DiscordNotifier(discord_url))
-        log.info("Discord notifier enabled.")
-
-    if not notifiers:
-        log.warning(
-            "No notification channels configured. Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID "
-            "and/or DISCORD_WEBHOOK_URL environment variables."
-        )
-    return MultiNotifier(notifiers)
+    raise ValueError(
+        "No watchlist found. Provide --ticker + --target-price, set the WATCHLIST "
+        f"env var, or create {args.watchlist_file}."
+    )
 
 
-# --------------------------------------------------------------------------
-# Data fetching
-# --------------------------------------------------------------------------
+# ==========================================================================
+# 2. MARKET DATA — fetching live price / volume via yfinance
+# ==========================================================================
 
 class StockDataFetcher:
-    """Wraps yfinance calls needed for the monitor."""
-
     def __init__(self, ticker: str):
-        self.ticker_symbol = ticker.upper()
-        self.ticker = yf.Ticker(self.ticker_symbol)
+        self.ticker_symbol = ticker
+        self.ticker = yf.Ticker(ticker)
 
-    def get_current_price_and_day_volume(self) -> Tuple[float, float]:
+    def get_current_price_and_day_volume(self) -> tuple[float, float]:
         """Latest intraday price and cumulative volume traded so far today."""
         data = self.ticker.history(period="1d", interval="1m")
         if data.empty:
@@ -150,24 +128,38 @@ class StockDataFetcher:
         hist = self.ticker.history(period=f"{lookback_days}d", interval="1d")
         if hist.empty:
             raise ValueError(f"No historical daily data for {self.ticker_symbol}")
-        # Drop today's partial bar if present so the baseline isn't skewed low.
+        # Drop today's partial bar (if present) so the baseline isn't skewed low.
         hist = hist.iloc[:-1] if len(hist) > 1 else hist
         return float(hist["Volume"].mean())
 
 
-# --------------------------------------------------------------------------
-# Trigger logic
-# --------------------------------------------------------------------------
+# ==========================================================================
+# 3. ALERT LOGIC — price-near-resistance + volume-spike, with per-ticker cooldown
+# ==========================================================================
+
+@dataclass
+class AlertEvent:
+    """Everything a notifier needs to format a message, in one place."""
+    ticker: str
+    price: float
+    target_price: float
+    volume: float
+    volume_threshold: float
+    volume_multiplier: float
+    avg_volume_days: int
+    timestamp: datetime = field(default_factory=datetime.now)
+
 
 class TriggerEvaluator:
-    def __init__(self, config: MonitorConfig, avg_volume: float):
-        self.config = config
+    def __init__(self, item: WatchItem, avg_volume: float, price_tolerance_pct: float):
+        self.item = item
         self.avg_volume = avg_volume
-        self.volume_threshold = avg_volume * config.volume_multiplier
+        self.price_tolerance_pct = price_tolerance_pct
+        self.volume_threshold = avg_volume * item.volume_multiplier
 
     def price_condition_met(self, current_price: float) -> bool:
-        # Triggers if price is at or above the target resistance
-        return current_price >= self.config.target_price
+        band = self.item.target_price * (self.price_tolerance_pct / 100)
+        return abs(current_price - self.item.target_price) <= band
 
     def volume_condition_met(self, current_volume: float) -> bool:
         return current_volume >= self.volume_threshold
@@ -176,69 +168,210 @@ class TriggerEvaluator:
         return self.price_condition_met(current_price) and self.volume_condition_met(current_volume)
 
 
-# --------------------------------------------------------------------------
-# Monitor loop
-# --------------------------------------------------------------------------
+def is_market_hours(now: Optional[datetime] = None) -> bool:
+    """True during US regular trading hours (9:30-16:00 America/New_York, Mon-Fri).
+    Does not account for market holidays."""
+    now = (now or datetime.now(EASTERN)).astimezone(EASTERN)
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
-class StockMonitor:
-    def __init__(self, config: MonitorConfig, notifier: Notifier):
-        self.config = config
+
+# ==========================================================================
+# 4. NOTIFICATIONS — Discord (embed), Telegram, and optional WhatsApp
+# ==========================================================================
+
+class Notifier:
+    def send(self, event: AlertEvent) -> bool:
+        raise NotImplementedError
+
+
+class DiscordNotifier(Notifier):
+    """Posts a formatted embed (not just plain text) to a Discord webhook."""
+
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+
+    def send(self, event: AlertEvent) -> bool:
+        payload = {
+            "embeds": [{
+                "title": f"🚨 {event.ticker} Resistance Breakout",
+                "color": 15158332,  # red
+                "fields": [
+                    {"name": "Price", "value": f"${event.price:,.2f}  (target ${event.target_price:,.2f})",
+                     "inline": False},
+                    {"name": "Volume", "value": f"{event.volume:,.0f}  "
+                                                 f"(≥ {event.volume_multiplier}x the {event.avg_volume_days}d avg, "
+                                                 f"threshold {event.volume_threshold:,.0f})",
+                     "inline": False},
+                ],
+                "timestamp": event.timestamp.isoformat(),
+            }]
+        }
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=10)
+            resp.raise_for_status()
+            return True
+        except requests.RequestException as e:
+            log.error(f"Discord notification failed for {event.ticker}: {e}")
+            return False
+
+
+class TelegramNotifier(Notifier):
+    def __init__(self, bot_token: str, chat_id: str):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+
+    def send(self, event: AlertEvent) -> bool:
+        text = (
+            f"🚨 *{event.ticker} Alert*\n"
+            f"Price: ${event.price:,.2f} (target ${event.target_price:,.2f})\n"
+            f"Volume: {event.volume:,.0f} (≥ {event.volume_multiplier}x the "
+            f"{event.avg_volume_days}d average)\n"
+            f"Time: {event.timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        try:
+            resp = requests.post(
+                url, data={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10
+            )
+            resp.raise_for_status()
+            return True
+        except requests.RequestException as e:
+            log.error(f"Telegram notification failed for {event.ticker}: {e}")
+            return False
+
+
+class WhatsAppNotifier(Notifier):
+    """Free, personal-use-only WhatsApp alerts via the CallMeBot API.
+    Each recipient must activate their own apikey first — see README."""
+
+    def __init__(self, phone: str, api_key: str):
+        self.phone = phone
+        self.api_key = api_key
+
+    def send(self, event: AlertEvent) -> bool:
+        text = (
+            f"{event.ticker} Alert: ${event.price:,.2f} (target ${event.target_price:,.2f}), "
+            f"volume {event.volume:,.0f} (>= {event.volume_multiplier}x avg)"
+        )
+        try:
+            resp = requests.get(
+                "https://api.callmebot.com/whatsapp.php",
+                params={"phone": self.phone, "text": text, "apikey": self.api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return True
+        except requests.RequestException as e:
+            log.error(f"WhatsApp notification to {self.phone} failed: {e}")
+            return False
+
+
+class MultiNotifier(Notifier):
+    """Fans an alert out to every configured channel."""
+
+    def __init__(self, notifiers: List[Notifier]):
+        self.notifiers = notifiers
+
+    def send(self, event: AlertEvent) -> bool:
+        if not self.notifiers:
+            log.warning("No notifiers configured — alert would not be delivered anywhere.")
+            return False
+        results = [n.send(event) for n in self.notifiers]
+        return any(results)
+
+
+def build_notifier_from_env() -> MultiNotifier:
+    notifiers: List[Notifier] = []
+
+    discord_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if discord_url:
+        notifiers.append(DiscordNotifier(discord_url))
+        log.info("Discord notifier enabled.")
+
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if tg_token and tg_chat:
+        notifiers.append(TelegramNotifier(tg_token, tg_chat))
+        log.info("Telegram notifier enabled.")
+
+    wa_phone = os.environ.get("WHATSAPP_PHONE")
+    wa_key = os.environ.get("WHATSAPP_APIKEY")
+    if wa_phone and wa_key:
+        notifiers.append(WhatsAppNotifier(wa_phone, wa_key))
+        log.info("WhatsApp notifier enabled (single recipient).")
+
+    wa_recipients_raw = os.environ.get("WHATSAPP_RECIPIENTS")
+    if wa_recipients_raw:
+        try:
+            for r in json.loads(wa_recipients_raw):
+                notifiers.append(WhatsAppNotifier(r["phone"], r["apikey"]))
+            log.info("WhatsApp notifier enabled (multi-recipient).")
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            log.error(f"Could not parse WHATSAPP_RECIPIENTS: {e}")
+
+    if not notifiers:
+        log.warning(
+            "No notification channels configured. Set DISCORD_WEBHOOK_URL, "
+            "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID, and/or WHATSAPP_* environment variables."
+        )
+    return MultiNotifier(notifiers)
+
+
+# ==========================================================================
+# 5. PER-TICKER MONITOR — baseline, cooldown state, single check
+# ==========================================================================
+
+class TickerMonitor:
+    """Owns the fetch/evaluate/cooldown lifecycle for exactly one ticker."""
+
+    def __init__(self, item: WatchItem, settings: MonitorSettings, notifier: Notifier):
+        self.item = item
+        self.settings = settings
         self.notifier = notifier
-        self.fetcher = StockDataFetcher(config.ticker)
+        self.fetcher = StockDataFetcher(item.ticker)
+        self.state_file = f"alert_state_{item.ticker}.json"
         self.last_alert_time: Optional[datetime] = self._load_last_alert_time()
         self.evaluator: Optional[TriggerEvaluator] = None
 
     def _load_last_alert_time(self) -> Optional[datetime]:
-        """Reads the last-alert timestamp from disk so the cooldown survives
-        across separate process runs (important when run via cron / CI, where
-        each run is a brand-new process with no memory of the previous one)."""
-        path = self.config.state_file
-        if not os.path.exists(path):
+        if not os.path.exists(self.state_file):
             return None
         try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            ts = data.get("last_alert_time")
+            with open(self.state_file) as f:
+                ts = json.load(f).get("last_alert_time")
             return datetime.fromisoformat(ts) if ts else None
         except (json.JSONDecodeError, ValueError, OSError) as e:
-            log.warning(f"Could not read state file {path}: {e}")
+            log.warning(f"Could not read {self.state_file}: {e}")
             return None
 
     def _save_last_alert_time(self) -> None:
-        path = self.config.state_file
         try:
-            with open(path, "w") as f:
+            with open(self.state_file, "w") as f:
                 json.dump({"last_alert_time": self.last_alert_time.isoformat()}, f)
         except OSError as e:
-            log.warning(f"Could not write state file {path}: {e}")
+            log.warning(f"Could not write {self.state_file}: {e}")
 
-    def _refresh_baseline(self) -> None:
-        avg_volume = self.fetcher.get_average_daily_volume(self.config.avg_volume_lookback_days)
-        self.evaluator = TriggerEvaluator(self.config, avg_volume)
+    def refresh_baseline(self) -> None:
+        avg_volume = self.fetcher.get_average_daily_volume(self.settings.avg_volume_lookback_days)
+        self.evaluator = TriggerEvaluator(self.item, avg_volume, self.settings.price_tolerance_pct)
         log.info(
-            f"[{self.config.ticker}] Baseline avg volume ({self.config.avg_volume_lookback_days}d): "
-            f"{avg_volume:,.0f} | Trigger volume threshold: {self.evaluator.volume_threshold:,.0f}"
+            f"[{self.item.ticker}] Baseline avg volume "
+            f"({self.settings.avg_volume_lookback_days}d): {avg_volume:,.0f} | "
+            f"Volume trigger threshold: {self.evaluator.volume_threshold:,.0f}"
         )
 
     def _in_cooldown(self) -> bool:
         if self.last_alert_time is None:
             return False
         elapsed_min = (datetime.now() - self.last_alert_time).total_seconds() / 60
-        return elapsed_min < self.config.cooldown_minutes
-
-    def _format_alert(self, price: float, volume: float) -> str:
-        return (
-            f"🚨 *{self.config.ticker} Alert*\n"
-            f"Price: ${price:,.2f} (target ${self.config.target_price:,.2f})\n"
-            f"Volume so far today: {volume:,.0f} "
-            f"(≥ {self.config.volume_multiplier}x the {self.config.avg_volume_lookback_days}d average)\n"
-            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        return elapsed_min < self.settings.cooldown_minutes
 
     def check_once(self) -> bool:
-        """Runs a single check. Returns True if an alert was sent."""
+        """Runs a single check for this ticker. Returns True if an alert was sent."""
         if self.evaluator is None:
-            self._refresh_baseline()
+            self.refresh_baseline()
 
         try:
             price, volume = self.fetcher.get_current_price_and_day_volume()
@@ -247,7 +380,7 @@ class StockMonitor:
             return False
 
         log.info(
-            f"[{self.config.ticker}] Price: ${price:,.2f} | Volume: {volume:,.0f} "
+            f"[{self.item.ticker}] Price: ${price:,.2f} | Volume: {volume:,.0f} "
             f"| Threshold: {self.evaluator.volume_threshold:,.0f}"
         )
 
@@ -255,104 +388,110 @@ class StockMonitor:
             return False
 
         if self.evaluator.evaluate(price, volume):
-            message = self._format_alert(price, volume)
-            sent = self.notifier.send(message)
+            event = AlertEvent(
+                ticker=self.item.ticker,
+                price=price,
+                target_price=self.item.target_price,
+                volume=volume,
+                volume_threshold=self.evaluator.volume_threshold,
+                volume_multiplier=self.item.volume_multiplier,
+                avg_volume_days=self.settings.avg_volume_lookback_days,
+            )
+            sent = self.notifier.send(event)
             if sent:
-                log.info(f"Alert sent for {self.config.ticker}.")
+                log.info(f"Alert sent for {self.item.ticker}.")
                 self.last_alert_time = datetime.now()
                 self._save_last_alert_time()
             return sent
         return False
 
-    def run(self) -> None:
-        log.info(
-            f"Starting monitor for {self.config.ticker} | target=${self.config.target_price} "
-            f"| poll every {self.config.poll_interval_sec}s"
-        )
-        self._refresh_baseline()
-        last_baseline_refresh = datetime.now()
 
-        while True:
+# ==========================================================================
+# 6. EXECUTION LOOP — runs the whole watchlist once, or continuously
+# ==========================================================================
+
+class WatchlistMonitor:
+    def __init__(self, settings: MonitorSettings, notifier: Notifier):
+        self.settings = settings
+        self.tickers = [TickerMonitor(item, settings, notifier) for item in settings.watchlist]
+        self._last_baseline_refresh = datetime.min
+
+    def check_all_once(self) -> None:
+        for tm in self.tickers:
             try:
-                self.check_once()
-                # Refresh the average-volume baseline once a day so it doesn't go stale.
-                if (datetime.now() - last_baseline_refresh).total_seconds() > 6 * 3600:
-                    self._refresh_baseline()
-                    last_baseline_refresh = datetime.now()
+                tm.check_once()
             except Exception as e:
-                log.exception(f"Unexpected error during check: {e}")
-            time.sleep(self.config.poll_interval_sec)
+                log.exception(f"Unexpected error checking {tm.item.ticker}: {e}")
+        self._last_baseline_refresh = datetime.now()
+
+    def run_loop(self) -> None:
+        log.info(
+            f"Starting monitor for {len(self.tickers)} ticker(s), "
+            f"checking every {self.settings.poll_interval_sec}s "
+            f"(market hours only: {self.settings.market_hours_only})"
+        )
+        while True:
+            if self.settings.market_hours_only and not is_market_hours():
+                log.info("Outside market hours — sleeping.")
+            else:
+                self.check_all_once()
+                # Refresh each ticker's volume baseline roughly every 6 hours.
+                if (datetime.now() - self._last_baseline_refresh).total_seconds() > 6 * 3600:
+                    for tm in self.tickers:
+                        tm.evaluator = None
+            time.sleep(self.settings.poll_interval_sec)
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # CLI
-# --------------------------------------------------------------------------
+# ==========================================================================
 
-def _load_target_price_from_config(ticker: str, config_file: str) -> Optional[float]:
-    """Looks up {ticker}.target_price in the JSON config. Returns None on any
-    missing file/key/null value so the caller can fall back to the CLI arg."""
-    if not os.path.exists(config_file):
-        return None
-    try:
-        with open(config_file, "r") as f:
-            data = json.load(f)
-        price = data.get(ticker.upper(), {}).get("target_price")
-        return float(price) if price is not None else None
-    except (json.JSONDecodeError, ValueError, OSError, AttributeError) as e:
-        log.warning(f"Could not read target price from {config_file}: {e}")
-        return None
-
-
-def parse_args() -> MonitorConfig:
-    parser = argparse.ArgumentParser(description="Monitor a stock for a price + volume breakout alert.")
-    parser.add_argument("--ticker", required=True, help="Stock ticker symbol, e.g. AAPL")
-    parser.add_argument("--target-price", required=True, type=float, help="Target/resistance price")
-    parser.add_argument("--config-file", type=str, default="targets.json",
-                         help="JSON file mapping ticker -> target_price, takes priority over --target-price if set (default: targets.json)")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Monitor a stock watchlist for resistance-breakout + high-volume alerts."
+    )
+    parser.add_argument("--ticker", help="Single ticker to watch (overrides watchlist file/env)")
+    parser.add_argument("--target-price", type=float, help="Target/resistance price (with --ticker)")
     parser.add_argument("--volume-multiplier", type=float, default=2.0,
-                         help="Volume must be >= this multiple of the average daily volume (default 2.0)")
+                         help="Volume must be >= this multiple of average volume (default 2.0)")
+    parser.add_argument("--watchlist-file", type=str, default="watchlist.json",
+                         help="Path to a JSON watchlist file (default watchlist.json)")
     parser.add_argument("--price-tolerance-pct", type=float, default=0.15,
                          help="Percent band around target price counted as 'touched' (default 0.15)")
-    parser.add_argument("--poll-interval", type=int, default=60, help="Seconds between checks (default 60)")
+    parser.add_argument("--poll-interval", type=int, default=120,
+                         help="Seconds between check cycles in loop mode (default 120)")
     parser.add_argument("--avg-volume-days", type=int, default=20,
                          help="Lookback window in days for average volume baseline (default 20)")
     parser.add_argument("--cooldown-minutes", type=int, default=30,
-                         help="Minutes to wait before re-alerting (default 30)")
-    parser.add_argument("--state-file", type=str, default=None,
-                         help="File used to persist the cooldown timer across runs "
-                              "(default: alert_state_<TICKER>.json)")
-    parser.add_argument("--once", action="store_true", help="Run a single check and exit, instead of looping")
+                         help="Minutes to wait before re-alerting the same ticker (default 30)")
+    parser.add_argument("--ignore-market-hours", action="store_true",
+                         help="Check even outside 9:30-16:00 ET (useful for testing, or non-US tickers)")
+    parser.add_argument("--once", action="store_true",
+                         help="Check the whole watchlist once and exit, instead of looping")
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    state_file = args.state_file or f"alert_state_{args.ticker.upper()}.json"
 
-    # JSON config takes priority; --target-price is the fallback if it's null/missing/unreadable.
-    target_price = _load_target_price_from_config(args.ticker, args.config_file)
-    if target_price is None:
-        target_price = args.target_price
-
-    return MonitorConfig(
-        ticker=args.ticker,
-        target_price=target_price,
-        volume_multiplier=args.volume_multiplier,
+def main() -> None:
+    args = parse_args()
+    watchlist = load_watchlist(args)
+    settings = MonitorSettings(
+        watchlist=watchlist,
         price_tolerance_pct=args.price_tolerance_pct,
         poll_interval_sec=args.poll_interval,
         avg_volume_lookback_days=args.avg_volume_days,
         cooldown_minutes=args.cooldown_minutes,
-        state_file=state_file,
-    ), args.once
-
-
-def main() -> None:
-    config, run_once = parse_args()
+        market_hours_only=not args.ignore_market_hours,
+    )
     notifier = build_notifier_from_env()
-    monitor = StockMonitor(config, notifier)
+    monitor = WatchlistMonitor(settings, notifier)
 
-    if run_once:
-        monitor.check_once()
+    if args.once:
+        # In one-shot mode (e.g. cron/CI), skip the market-hours gate entirely —
+        # the scheduler is what decides when to run; we just check when asked.
+        monitor.check_all_once()
     else:
         try:
-            monitor.run()
+            monitor.run_loop()
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             sys.exit(0)
