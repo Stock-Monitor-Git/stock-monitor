@@ -38,7 +38,7 @@ jobs:
           # to add/remove tickers, no code changes needed.
           WATCHLIST: ${{ vars.STOCKS }}
         run: |
-          python stock_monitor.py --once --ignore-market-hours
+          python stock_monitor.py --once
 
       - name: Save cooldown state
         run: |
