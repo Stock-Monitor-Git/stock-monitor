@@ -8,15 +8,11 @@ on:
   workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
 
 permissions:
-  contents: write   # needed so the workflow can commit the updated cooldown state file back
+  contents: write   # needed so the workflow can commit updated cooldown state files back
 
 jobs:
-  check-stock:
+  check-watchlist:
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1   # run one stock at a time so state-file commits/pushes don't collide
-      matrix:
-        stock: ${{ fromJson(vars.STOCKS) }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -29,28 +25,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run stock check
+      - name: Run stock check (whole watchlist, one run)
         env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
+          WHATSAPP_RECIPIENTS: ${{ secrets.WHATSAPP_RECIPIENTS }}
+          # STOCKS repo variable (JSON list) feeds the script's WATCHLIST env var —
+          # edit the STOCKS variable in Settings > Secrets and variables > Actions
+          # to add/remove tickers, no code changes needed.
+          WATCHLIST: ${{ vars.STOCKS }}
         run: |
-          python stock_monitor.py \
-            --ticker "${{ matrix.stock.ticker }}" \
-            --target-price "${{ matrix.stock.target_price }}" \
-            --volume-multiplier "${{ matrix.stock.volume_multiplier }}" \
-            --once
+          python stock_monitor.py --once --ignore-market-hours
 
       - name: Save cooldown state
         run: |
-          STATE_FILE="alert_state_$(echo '${{ matrix.stock.ticker }}' | tr '[:lower:]' '[:upper:]').json"
-          if [ -f "$STATE_FILE" ]; then
-            git config user.name "stock-monitor-bot"
-            git config user.email "actions@github.com"
-            git pull --rebase
-            git add "$STATE_FILE"
-            git diff --staged --quiet || git commit -m "Update alert cooldown state for ${{ matrix.stock.ticker }} [skip ci]"
-            git push
-          else
-            echo "No $STATE_FILE yet (no alert has fired) — nothing to commit."
-          fi
+          git config user.name "stock-monitor-bot"
+          git config user.email "actions@github.com"
+          git add alert_state_*.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Update alert cooldown state [skip ci]"
+          git diff --staged --quiet || git push
