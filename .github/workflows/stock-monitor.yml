@@ -33,6 +33,8 @@ jobs:
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
           WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
           WHATSAPP_RECIPIENTS: ${{ secrets.WHATSAPP_RECIPIENTS }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           # STOCKS repo variable (JSON list) feeds the script's WATCHLIST env var —
           # edit the STOCKS variable in Settings > Secrets and variables > Actions
           # to add/remove tickers, no code changes needed.
