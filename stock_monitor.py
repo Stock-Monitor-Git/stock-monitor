@@ -76,6 +76,32 @@ class MonitorSettings:
     market_hours_only: bool = True          # skip checks outside US market hours (9:30-16:00 ET, Mon-Fri)
 
 
+def load_supabase_watchlist() -> List[WatchItem]:
+    """Fetches the shared watchlist from Supabase (the same table the web
+    dashboard reads/writes), if SUPABASE_URL + SUPABASE_SERVICE_KEY are set.
+    Returns an empty list (not an error) if Supabase isn't configured, so
+    this stays fully optional for anyone not using the dashboard."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        return []
+    try:
+        resp = requests.get(
+            f"{url}/rest/v1/stock_watchlist?select=*",
+            headers={"apikey": key, "Authorization": f"Bearer {key}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        return [
+            WatchItem(r["ticker"].upper(), float(r["target_price"]), float(r.get("volume_multiplier", 2.0)))
+            for r in rows
+        ]
+    except requests.RequestException as e:
+        log.error(f"Could not fetch Supabase watchlist: {e}")
+        return []
+
+
 def load_watchlist(args: argparse.Namespace) -> List[WatchItem]:
     """Builds the effective watchlist by MERGING every source that's present —
     not "first source wins" — so you and a collaborator can each maintain your
@@ -87,8 +113,11 @@ def load_watchlist(args: argparse.Namespace) -> List[WatchItem]:
       1. --ticker / --target-price CLI flags (single stock — used alone, bypasses everything else)
       2. the WATCHLIST environment variable (JSON string — this is what your
          STOCKS GitHub Actions variable feeds in)
-      3. watchlist.json (a single shared file, if present)
-      4. every *.json file inside the watchlists/ folder (if present) — this is
+      3. Supabase (if SUPABASE_URL + SUPABASE_SERVICE_KEY are set) — the same
+         table the web dashboard reads/writes, so anything added there is
+         picked up automatically
+      4. watchlist.json (a single shared file, if present)
+      5. every *.json file inside the watchlists/ folder (if present) — this is
          the "everyone has their own file" option: e.g. watchlists/sagi.json,
          watchlists/friend.json
     """
@@ -108,6 +137,10 @@ def load_watchlist(args: argparse.Namespace) -> List[WatchItem]:
     raw = os.environ.get("WATCHLIST")
     if raw:
         sources.append(parse_items(json.loads(raw)))
+
+    supabase_items = load_supabase_watchlist()
+    if supabase_items:
+        sources.append(supabase_items)
 
     if os.path.exists(args.watchlist_file):
         with open(args.watchlist_file) as f:
